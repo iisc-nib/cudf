@@ -732,7 +732,7 @@ ConfigureTest(
 )
 ConfigureTest(STREAM_UNARY_TEST streams/unary_test.cpp STREAM_MODE testing)
 
-ConfigureTest(LEARN_CUDA_TEST learn_cudf/learn_cudf.cpp groupby/groupby_test_util.cpp)
+ConfigureTest(LEARN_CUDA_TEST learn_cudf/learn_cudf.cpp groupby/groupby_test_util.cpp learn_cudf/learn_cudf_kernels.cu)
 
 # ##################################################################################################
 # Install tests ####################################################################################
