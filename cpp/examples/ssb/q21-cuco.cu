@@ -58,7 +58,6 @@ __global__ void probe(Map part_map,
   auto this_thread = cg::tiled_partition<TILE_SIZE>(cg::this_thread_block());
 
   if (!part_map.contains(this_thread, lo_partkey[tid]) ||
-      !date_map.contains(this_thread, lo_orderdate[tid]) ||
       !supp_map.contains(this_thread, lo_suppkey[tid]))
     return;
 
@@ -224,12 +223,15 @@ int main(int argc, char** argv)
    * Also the below code demonstrates how to do a probe of host side if ever needed.
    */
   thrust::device_vector<int> partkey_lookup, datekey_lookup;
+  int res = 0;
   for (int i=0; i<LO_LEN; i++) {
     if (h_res[i]) {
+      res++;
       partkey_lookup.push_back(h_lo_partkey[i]);
       datekey_lookup.push_back(h_lo_orderdate[i]);
     }
   }
+  std::cout << "Total after join: " << res << std::endl;
   thrust::device_vector<cuco::pair<int, int>> part_res(probed), year_res(probed);
   part_map.retrieve(partkey_lookup.begin(), partkey_lookup.end(), part_res.begin());
   date_map.retrieve(datekey_lookup.begin(), datekey_lookup.end(), year_res.begin());
