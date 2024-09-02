@@ -53,15 +53,20 @@ __global__ void probe(Map part_map,
                       int* res,
                       int lo_size)
 {
-  int tid = (threadIdx.x + blockIdx.x * blockDim.x) / TILE_SIZE;
+  int tid = ((threadIdx.x + blockIdx.x * blockDim.x) / TILE_SIZE);
   if (tid >= lo_size) return;
   auto this_thread = cg::tiled_partition<TILE_SIZE>(cg::this_thread_block());
 
-  if (!part_map.contains(this_thread, lo_partkey[tid]) ||
-      !supp_map.contains(this_thread, lo_suppkey[tid]))
-    return;
-
-  res[tid] = 1;
+  auto part_idx = part_map.find(lo_partkey[tid]);
+  auto supp_idx = supp_map.find(lo_suppkey[tid]);
+  auto date_idx = date_map.find(lo_orderdate[tid]);
+  if (part_idx != part_map.end() && supp_idx != supp_map.end()) {
+    int hash = (p_brand[part_idx->second] * 7 +  (d_year[date_idx->second] - 1992)) % ((1998-1992+1) * (5*5*40));
+    res[hash * 4] = d_year[date_idx->second];
+    res[hash * 4 + 1] = p_brand[part_idx->second];
+    atomicAdd(reinterpret_cast<unsigned long long*>(&res[hash * 4 + 2]), (long long)(lo_revenue[tid]));
+    // res[tid] = 1;
+  }
 }
 
 template <typename Map>
@@ -106,15 +111,17 @@ int main(int argc, char** argv)
   }
   std::cout << "MFGR12/TOTAL: " << mfgr12_count << "/" << P_LEN
             << " part category selectivity: " << (float)mfgr12_count * 100 / (float)P_LEN << "%" << std::endl;
-  int* h_res = (int*)malloc(sizeof(int) * LO_LEN);
-  memset(h_res, 0, sizeof(int) * LO_LEN);
+  int res_size = ((1998-1992+1) * (5 * 5 * 40));
+  int res_array_size = res_size * 4;
+  int* h_res = (int*)malloc(sizeof(int) * res_array_size);
+  memset(h_res, 0, sizeof(int) * res_array_size);
 
   int *d_p_partkey, *d_p_category, *d_res, *d_lo_partkey, *d_lo_orderdate, *d_lo_suppkey,
     *d_s_region, *d_s_suppkey, *d_d_datekey, *d_p_brand, *d_lo_revenue, *d_d_year;
   cudaMalloc(&d_p_partkey, P_LEN * sizeof(int));
   cudaMalloc(&d_p_category, P_LEN * sizeof(int));
   cudaMalloc(&d_p_brand, P_LEN * sizeof(int));
-  cudaMalloc(&d_res, LO_LEN * sizeof(int));
+  cudaMalloc(&d_res, res_array_size * sizeof(int));
   cudaMalloc(&d_lo_partkey, LO_LEN * sizeof(int));
   cudaMalloc(&d_lo_orderdate, LO_LEN * sizeof(int));
   cudaMalloc(&d_lo_suppkey, LO_LEN * sizeof(int));
@@ -127,7 +134,7 @@ int main(int argc, char** argv)
   cudaMemcpy(d_p_partkey, h_p_partkey, P_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_p_category, h_p_category, P_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_p_brand, h_p_brand1, P_LEN * sizeof(int), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_res, h_res, LO_LEN * sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_res, h_res, res_array_size * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_lo_partkey, h_lo_partkey, LO_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_lo_orderdate, h_lo_orderdate, LO_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_lo_suppkey, h_lo_suppkey, LO_LEN * sizeof(int), cudaMemcpyHostToDevice);
@@ -150,52 +157,37 @@ int main(int argc, char** argv)
   int date_grid     = std::ceil((float)D_LEN / ((float)threadBlock));
   //   build_hash<<<grid, threadBlock>>>(insert_ref, h_s_suppkey, P_LEN);
 
-  auto part_map = cuco::static_multimap<
-    int,
-    int,
-    cuda::thread_scope_device,
-    cuco::cuda_allocator<char>,
-    cuco::legacy::double_hashing<TILE_SIZE, cuco::default_hash_function<int>>>{
-    part_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}};
-  auto supplier_map = cuco::static_multimap<
-    int,
-    int,
-    cuda::thread_scope_device,
-    cuco::cuda_allocator<char>,
-    cuco::legacy::double_hashing<TILE_SIZE, cuco::default_hash_function<int>>>{
-    supplier_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}};
-  auto date_map = cuco::static_multimap<
-    int,
-    int,
-    cuda::thread_scope_device,
-    cuco::cuda_allocator<char>,
-    cuco::legacy::double_hashing<TILE_SIZE, cuco::default_hash_function<int>>>{
-    date_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}};
+  auto part_map = cuco::static_map{part_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}, thrust::equal_to<int>{},
+                              cuco::linear_probing<TILE_SIZE, cuco::default_hash_function<int>>{}};
+  auto supplier_map = cuco::static_map{supplier_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}, thrust::equal_to<int>{},
+                              cuco::linear_probing<TILE_SIZE, cuco::default_hash_function<int>>{}};
+  auto date_map = cuco::static_map{date_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}, thrust::equal_to<int>{},
+                              cuco::linear_probing<TILE_SIZE, cuco::default_hash_function<int>>{}};
 
   // std::cout << "Launching kernel with grid: " << part_grid << " tb size: " << threadBlock <<
   // std::endl;
   build_hash_filtered<<<part_grid, TILE_SIZE * threadBlock>>>(
-    part_map.get_device_mutable_view(),
+    part_map.ref(cuco::insert),
     d_p_partkey,
     d_p_category,
     P_LEN,
     1 /*filter by part_category=mfgr#12*/);
   cudaDeviceSynchronize();
   build_hash_filtered<<<supplier_grid, TILE_SIZE * threadBlock>>>(
-    supplier_map.get_device_mutable_view(),
+    supplier_map.ref(cuco::insert),
     d_s_suppkey,
     d_s_region,
     P_LEN,
     1 /*s_region = AMERICA*/);
   cudaDeviceSynchronize();
   build_hash<<<date_grid, TILE_SIZE * threadBlock>>>(
-    date_map.get_device_mutable_view(), d_d_datekey, D_LEN);
-  cudaDeviceSynchronize();
+    date_map.ref(cuco::insert), d_d_datekey, D_LEN);
+  // cudaDeviceSynchronize();
 
-  probe<<<std::ceil((float)LO_LEN / (float)threadBlock), TILE_SIZE * threadBlock>>>(
-    part_map.get_device_view(),
-    date_map.get_device_view(),
-    supplier_map.get_device_view(),
+  probe<<<std::ceil((float)LO_LEN / (float)threadBlock), (TILE_SIZE * threadBlock)>>>(
+    part_map.ref(cuco::find),
+    date_map.ref(cuco::find),
+    supplier_map.ref(cuco::find),
     d_lo_partkey,
     d_lo_orderdate,
     d_lo_suppkey,
@@ -206,43 +198,15 @@ int main(int argc, char** argv)
     LO_LEN);
   cudaDeviceSynchronize();
 
-  std::cout << "Part map size: " << part_map.get_size()
-            << "Part map capacity: " << part_map.get_capacity() << std::endl;
+  // std::cout << "Part map size: " << part_map.get_size()
+  //           << "Part map capacity: " << part_map.get_capacity() << std::endl;
 
-  cudaMemcpy(h_res, d_res, LO_LEN * sizeof(int), cudaMemcpyDeviceToHost);
-  int probed = 0;
-  for (int i = 0; i < LO_LEN; i++) {
-    probed += h_res[i];
-  }
-  std::cout << "Total probed: " << probed << std::endl;
-
-
-  /**
-   * Below section is just a temporary workaround for probing.
-   * TODO: need to understand how to retrieve probe from the device kernel
-   * Also the below code demonstrates how to do a probe of host side if ever needed.
-   */
-  thrust::device_vector<int> partkey_lookup, datekey_lookup;
-  int res = 0;
-  for (int i=0; i<LO_LEN; i++) {
-    if (h_res[i]) {
-      res++;
-      partkey_lookup.push_back(h_lo_partkey[i]);
-      datekey_lookup.push_back(h_lo_orderdate[i]);
+  cudaMemcpy(h_res, d_res, res_array_size * sizeof(int), cudaMemcpyDeviceToHost);
+  for (int i = 0; i < res_size; i++) {
+    if (h_res[4*i] != 0) {
+      cout << h_res[4*i] << " " << h_res[4*i + 1] << " " << reinterpret_cast<unsigned long long*>(&h_res[4*i + 2])[0]  << endl;
     }
   }
-  std::cout << "Total after join: " << res << std::endl;
-  thrust::device_vector<cuco::pair<int, int>> part_res(probed), year_res(probed);
-  part_map.retrieve(partkey_lookup.begin(), partkey_lookup.end(), part_res.begin());
-  date_map.retrieve(datekey_lookup.begin(), datekey_lookup.end(), year_res.begin());
-  thrust::host_vector<cuco::pair<int, int>> h_part_res(part_res), h_year_res(year_res);
-  // print brands
-  std::set<pair<int, int>> groups;
-  for (int i=0; i<probed; i++) {
-    // std::cout << h_part_res[i].first << ": brand " << h_p_brand1[h_part_res[i].second] << std::endl;
-    groups.insert(std::make_pair(h_d_year[h_year_res[i].second], h_p_brand1[h_part_res[i].second]));
-  }
-  std::cout << "Total groups: " << groups.size() << std::endl;
   
   return 0;
 }
