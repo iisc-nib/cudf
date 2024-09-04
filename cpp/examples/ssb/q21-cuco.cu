@@ -51,22 +51,24 @@ __global__ void probe(Map part_map,
                       int* d_year,
                       int* p_brand,
                       int* res,
-                      int lo_size)
+                      int lo_size, bool* suppkey_bloom, bool* partkey_bloom)
 {
   int tid = ((threadIdx.x + blockIdx.x * blockDim.x) / TILE_SIZE);
   if (tid >= lo_size) return;
-  auto this_thread = cg::tiled_partition<TILE_SIZE>(cg::this_thread_block());
-
-  auto part_idx = part_map.find(lo_partkey[tid]);
+  // auto this_thread = cg::tiled_partition<TILE_SIZE>(cg::this_thread_block());
+  if (suppkey_bloom[(lo_suppkey[tid]-1)%S_LEN] == false || partkey_bloom[(lo_partkey[tid]-1)%P_LEN] == false) return;
   auto supp_idx = supp_map.find(lo_suppkey[tid]);
+  if (supp_idx == supp_map.end()) return;
+  auto part_idx = part_map.find(lo_partkey[tid]);
+  if (part_idx == part_map.end()) return;
   auto date_idx = date_map.find(lo_orderdate[tid]);
-  if (part_idx != part_map.end() && supp_idx != supp_map.end()) {
+  // if (part_idx != part_map.end()) {
     int hash = (p_brand[part_idx->second] * 7 +  (d_year[date_idx->second] - 1992)) % ((1998-1992+1) * (5*5*40));
     res[hash * 4] = d_year[date_idx->second];
     res[hash * 4 + 1] = p_brand[part_idx->second];
     atomicAdd(reinterpret_cast<unsigned long long*>(&res[hash * 4 + 2]), (long long)(lo_revenue[tid]));
     // res[tid] = 1;
-  }
+  // }
 }
 
 template <typename Map>
@@ -104,6 +106,49 @@ int main(int argc, char** argv)
 
   int* h_s_suppkey = loadColumn<int>("s_suppkey", S_LEN);
   int* h_s_region  = loadColumn<int>("s_region", S_LEN);
+  bool* bloom_suppkey = (bool*)malloc((S_LEN)); // assign S_LEN bits 
+  bool* bloom_partkey = (bool*)malloc((P_LEN)); // assing P_LEN bits to this bloomfilter
+  memset(bloom_suppkey, 0, (S_LEN)*sizeof(bool));
+  memset(bloom_partkey, 0, (P_LEN)*sizeof(bool));
+  // for (int i=0; i<S_LEN; i++) {
+  //   if (h_s_region == 1) {
+  //     int bloom_idx = hash_fn(h_s_suppkey[i])%S_LEN;
+  //     int i1 = bloom_idx/sizeof(int);
+  //     int val = 0x1 << ((sizeof(int)*8) - 1 - bloom_idx%(sizeof(int)*8));
+  //   }
+  // }
+  int ass=0, aps = 0;
+  for (int i=0; i<S_LEN; i++) {
+    if (h_s_region[i] == 1) {
+      int bloom_idx = (h_s_suppkey[i]-1)%S_LEN;
+      bloom_suppkey[bloom_idx] = true;
+      ass++;
+    }
+  }
+  for (int i=0; i<P_LEN; i++) {
+    if (h_p_category[i] == 1) {
+      int bloom_idx = (h_p_partkey[i]-1)%P_LEN;
+      bloom_partkey[bloom_idx] = true;
+      aps++;
+    }
+  }
+
+  // int ss=0, ps=0;
+  // for (int i=0; i<S_LEN; i++) ss+=bloom_suppkey[i];
+  // for (int i=0; i<P_LEN; i++) ps+=bloom_partkey[i];
+  // std::cout << ass << " " << ss << std::endl;
+  // std::cout << aps << " " << ps << std::endl;
+
+
+  // std::map<int, int> hmap1;
+  // for (int i=0; i<S_LEN; i++) {
+  //   if (h_s_region[i] == 1) hmap1[h_s_suppkey[i]] = i;
+  // }
+  // int res = 0;
+  // for (int i=0; i<LO_LEN; i++) {
+  //   if (hmap1.find(h_lo_suppkey[i]) != hmap1.end()) res++;
+  // }
+  // std::cout << "Selectivity of suppkey in lineorder: " << res << std::endl;
 
   int mfgr12_count = 0;
   for (int i = 0; i < P_LEN; i++) {
@@ -118,6 +163,7 @@ int main(int argc, char** argv)
 
   int *d_p_partkey, *d_p_category, *d_res, *d_lo_partkey, *d_lo_orderdate, *d_lo_suppkey,
     *d_s_region, *d_s_suppkey, *d_d_datekey, *d_p_brand, *d_lo_revenue, *d_d_year;
+  bool *d_suppkey_bloom, *d_partkey_bloom;
   cudaMalloc(&d_p_partkey, P_LEN * sizeof(int));
   cudaMalloc(&d_p_category, P_LEN * sizeof(int));
   cudaMalloc(&d_p_brand, P_LEN * sizeof(int));
@@ -130,6 +176,8 @@ int main(int argc, char** argv)
   cudaMalloc(&d_s_region, S_LEN * sizeof(int));
   cudaMalloc(&d_d_datekey, D_LEN * sizeof(int));
   cudaMalloc(&d_d_year, D_LEN * sizeof(int));
+  cudaMalloc(&d_suppkey_bloom, S_LEN * sizeof(bool));
+  cudaMalloc(&d_partkey_bloom, P_LEN * sizeof(bool));
 
   cudaMemcpy(d_p_partkey, h_p_partkey, P_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_p_category, h_p_category, P_LEN * sizeof(int), cudaMemcpyHostToDevice);
@@ -143,6 +191,8 @@ int main(int argc, char** argv)
   cudaMemcpy(d_s_region, h_s_region, S_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_d_datekey, h_d_datekey, D_LEN * sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(d_d_year, h_d_year, D_LEN * sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_suppkey_bloom, bloom_suppkey, S_LEN * sizeof(bool), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_partkey_bloom, bloom_partkey, P_LEN * sizeof(bool), cudaMemcpyHostToDevice);
 
   // first stage is to make a predicated join using cuco static multimap
   // build hash table for part, supplier and date, and one kernel for probe phase
@@ -158,11 +208,11 @@ int main(int argc, char** argv)
   //   build_hash<<<grid, threadBlock>>>(insert_ref, h_s_suppkey, P_LEN);
 
   auto part_map = cuco::static_map{part_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}, thrust::equal_to<int>{},
-                              cuco::linear_probing<TILE_SIZE, cuco::default_hash_function<int>>{}};
+                              cuco::double_hashing<TILE_SIZE, cuco::default_hash_function<int>>{}};
   auto supplier_map = cuco::static_map{supplier_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}, thrust::equal_to<int>{},
-                              cuco::linear_probing<TILE_SIZE, cuco::default_hash_function<int>>{}};
+                              cuco::double_hashing<TILE_SIZE, cuco::default_hash_function<int>>{}};
   auto date_map = cuco::static_map{date_capacity, cuco::empty_key{-1}, cuco::empty_value{-1}, thrust::equal_to<int>{},
-                              cuco::linear_probing<TILE_SIZE, cuco::default_hash_function<int>>{}};
+                              cuco::double_hashing<TILE_SIZE, cuco::default_hash_function<int>>{}};
 
   // std::cout << "Launching kernel with grid: " << part_grid << " tb size: " << threadBlock <<
   // std::endl;
@@ -195,7 +245,8 @@ int main(int argc, char** argv)
     d_d_year,
     d_p_brand,
     d_res,
-    LO_LEN);
+    LO_LEN,
+    d_suppkey_bloom, d_partkey_bloom);
   cudaDeviceSynchronize();
 
   // std::cout << "Part map size: " << part_map.get_size()
